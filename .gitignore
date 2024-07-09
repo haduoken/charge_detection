@@ -2,3 +2,5 @@ data
 PennFudanPed
 checkpoints
 __pycache__
+*.pth
+.vscode

@@ -1,162 +1,169 @@
 import os
-
-import cv2
 import torch
-
-from torchvision.io import read_image
+from torchvision.io import read_image, ImageReadMode
 from torchvision.ops.boxes import masks_to_boxes
 from torchvision import tv_tensors
 from torchvision.transforms.v2 import functional as F
+from torch.utils.data import Dataset, DataLoader
+import os
+import numpy as np
+import torch
+from PIL import Image
+from torchvision.transforms import v2
+from torchvision import tv_tensors
+from torchvision.ops import box_convert
+from helpers import plot
+from matplotlib import pyplot as plt
+from box_ops import box_cxcywh_to_xyxy
+from torch.utils.data import DataLoader, random_split, Subset
+import cv2
 
 
-class YOLODataSet(torch.utils.data.Dataset):
-    def __init__(self, root, transforms):
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, root):
         self.root = root
-        self.transforms = transforms
-        self.imgs = os.listdir(os.path.join(root, "images"))
-
-    def show(self, idx):
-        img_path = os.path.join(self.root, "images", self.imgs[idx])
-        # image name xxx.jpg
-        pure_name = os.path.splitext(os.path.basename(img_path))[0]
-        anno_path = os.path.join(self.root, "annotations", f'{pure_name}.txt')
-
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-
-        h, w, _ = img.shape
-
-        with open(anno_path, 'r') as f:
-            for line in f.readlines():
-                data = line.split(' ')
-                cx, cy, bw, bh = float(data[1]), float(data[2]), abs(float(data[3])), abs(float(data[4]))
-                x1, y1, x2, y2 = w * (cx - bw * 0.5), h * (cy - bh * 0.5), w * (cx + bw * 0.5), h * (cy + bh * 0.5)
-                cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255))
-
-                cv2.imshow('sdf', img)
-                cv2.waitKey(-1)
+        self.files = []
+        for file in os.listdir(root):
+            self.files.append(os.path.join(root, file))
 
     def __getitem__(self, idx):
-        # load images and masks
-        img_path = os.path.join(self.root, "images", self.imgs[idx])
-        # image name xxx.jpg
-        pure_name = os.path.splitext(os.path.basename(img_path))[0]
-        anno_path = os.path.join(self.root, "annotations", f'{pure_name}.txt')
-
-        img = read_image(img_path)
-
-        _, h, w = img.size()
-
-        # read anno file
-        #
-        bbox_data = []
-        label = []
-        area = []
-        iscrowd = []
-        with open(anno_path, 'r') as f:
-            line_cnt = 0
-            for line in f.readlines():
-                data = line.split(' ')
-                cx, cy, bw, bh = float(data[1]), float(data[2]), abs(float(data[3])), abs(float(data[4]))
-
-                x1, y1, x2, y2 = w * (cx - bw * 0.5), h * (cy - bh * 0.5), w * (cx + bw * 0.5), h * (cy + bh * 0.5)
-                bbox_data.append([x1, y1, x2, y2])
-                label.append(1)
-                area.append(bw * bh * h * w)
-                iscrowd.append(False)
-                line_cnt += 1
-            if line_cnt >= 2:
-                print(f'file {anno_path} has multi center')
-
-        # Wrap sample and targets into torchvision tv_tensors:
-        img = tv_tensors.Image(img)
-
-        target = {}
-        target["boxes"] = tv_tensors.BoundingBoxes(bbox_data, format="XYXY", canvas_size=F.get_size(img))
-        target["labels"] = torch.tensor(label, dtype=torch.int64)
-        target["image_id"] = idx
-        target["area"] = torch.tensor(area, dtype=torch.float)
-        target["iscrowd"] = torch.tensor(iscrowd, dtype=torch.int64)
-
-        if self.transforms is not None:
-            img, target = self.transforms(img, target)
-
-        return img, target
+        data = torch.load(self.files[idx])
+        data['img'] = data['img'][None, ...]
+        return data
 
     def __len__(self):
-        return len(self.imgs)
+        return len(self.files)
 
 
-class PennFudanDataset(torch.utils.data.Dataset):
-    def __init__(self, root, transforms):
+class ChargeDataset(torch.utils.data.Dataset):
+
+    def __init__(self, root):
         self.root = root
-        self.transforms = transforms
+
+        self.target_img_w = 64
+        self.target_img_h = 64
+
         # load all image files, sorting them to
         # ensure that they are aligned
-        self.imgs = list(sorted(os.listdir(os.path.join(root, "PNGImages"))))
-        self.masks = list(sorted(os.listdir(os.path.join(root, "PedMasks"))))
+        self.imgs = list(sorted(os.listdir(os.path.join(root, "images"))))
+        self.annos = list(sorted(os.listdir(os.path.join(root, "annotations"))))
 
     def __getitem__(self, idx):
         # load images and masks
-        img_path = os.path.join(self.root, "PNGImages", self.imgs[idx])
-        mask_path = os.path.join(self.root, "PedMasks", self.masks[idx])
-        img = read_image(img_path)
-        mask = read_image(mask_path)
-        # instances are encoded as different colors
-        obj_ids = torch.unique(mask)
-        # first id is the background, so remove it
-        obj_ids = obj_ids[1:]
-        num_objs = len(obj_ids)
+        img_path = os.path.join(self.root, "images", self.imgs[idx])
+        anno_path = os.path.join(self.root, "annotations", self.annos[idx])
+        # img = Image.open(img_path).convert("RGB")
+        img = read_image(img_path, ImageReadMode.GRAY)
 
-        # split the color-encoded mask into a set
-        # of binary masks
-        masks = (mask == obj_ids[:, None, None]).to(dtype=torch.uint8)
+        # resize
+        img = img / 255
+        img = F.resize(img, [self.target_img_h, self.target_img_w], antialias=True)
 
-        # get bounding box coordinates for each mask
-        boxes = masks_to_boxes(masks)
+        has_ob = False
+        cx = 0
+        with open(anno_path, 'r') as f:
+            anno_arr = f.read().splitlines()
+            for anno in anno_arr:
+                anno = [x for x in anno.strip().split(' ')]
+                cx = float(anno[1])
+                has_ob = True
+                break
 
-        # there is only one class
-        labels = torch.ones((num_objs,), dtype=torch.int64)
-
-        image_id = idx
-        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
-        # suppose all instances are not crowd
-        iscrowd = torch.zeros((num_objs,), dtype=torch.int64)
-
-        # Wrap sample and targets into torchvision tv_tensors:
-        img = tv_tensors.Image(img)
-
-        target = {}
-        target["boxes"] = tv_tensors.BoundingBoxes(boxes, format="XYXY", canvas_size=F.get_size(img))
-        target["masks"] = tv_tensors.Mask(masks)
-        target["labels"] = labels
-        target["image_id"] = image_id
-        target["area"] = area
-        target["iscrowd"] = iscrowd
-
-        if self.transforms is not None:
-            img, target = self.transforms(img, target)
-
-        return img, target
+        return {
+            'img': img,
+            'cls': torch.tensor(has_ob, dtype=torch.long),
+            'pt': torch.tensor(cx, dtype=torch.float32),
+        }
 
     def __len__(self):
         return len(self.imgs)
+
+
+class TrackingDataset(Dataset):
+
+    def __init__(self, root) -> None:
+        super().__init__()
+        self.files = [os.path.join(root, x) for x in os.listdir(root)]
+
+    def __getitem__(self, index):
+        data = torch.load(self.files[index])
+        return data
+
+    def __len__(self):
+        return len(self.files)
+
+
+def get_loader(BS):
+    dataset = ChargeDataset('/home/kilox/data/charge_station/ori')
+    tracking_root = '/home/kilox/data/charge_station/tracking'
+    for folder in os.listdir(tracking_root):
+        dir = os.path.join(tracking_root, folder)
+        dataset += TrackingDataset(dir)
+
+    positive_len = len(dataset)
+
+    empty_root = '/home/kilox/data/charge_station/empty'
+    for folder in os.listdir(empty_root):
+        dir = os.path.join(empty_root, folder)
+        dataset += TrackingDataset(dir)
+
+    negtive_len = len(dataset) - positive_len
+
+    print(f'dataset size {len(dataset)} positive {positive_len} negtive {negtive_len} p/n {positive_len/negtive_len}')
+
+    train_set, val_set = random_split(dataset, [0.7, 0.3])
+
+    train_loader = DataLoader(train_set, batch_size=BS, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_set, batch_size=BS, shuffle=True, drop_last=False)
+
+    return train_loader, val_loader
 
 
 if __name__ == '__main__':
-    dataset = YOLODataSet('/home/kilox/workspace/charge_detection/data', None)
 
-    # data_loader = torch.utils.data.DataLoader(
-    #     dataset,
-    #     batch_size=1,
-    #     shuffle=True,
-    #     num_workers=1,
-    # )
-    #
-    # for data in data_loader:
-    #     pass
-    # print(data)
+    def register_torch():
+        import torch
 
-    for i in range(1000):
-        dataset.show(i)
-    # print(dataset.__len__())
-    # print(dataset.__getitem__(0))
+        try:
+            if torch.already_registed:
+                pass
+        except:
+            print('register print')
+            torch.already_registed = True
+            original_repr = torch.Tensor.__repr__
+            torch.Tensor.__repr__ = lambda self: f'{{Tensor:{tuple(self.shape)}}} {original_repr(self)}'
+
+    register_torch()
+
+    # dataset = CustomDataset('/home/kilox/data/test_charge')
+    # dataloader = DataLoader(dataset, batch_size=16, shuffle=True, drop_last=False)
+
+    # for data in dataloader:
+    #     print(data)
+    loader1, loader2 = get_loader(1)
+    for data in loader1:
+        img = data['img']
+        cls = data['cls']
+        pt = data['pt']
+
+        img = img[0]
+        img = F.to_dtype(img, torch.uint8, scale=True)
+
+        img = img.permute(1, 2, 0).numpy()
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        h, w, _ = img.shape
+        if cls.item() == 1:
+            pt = pt.item()
+            x = int(pt * w)
+            cv2.line(img, (x, 0), (x, h - 1), (255, 0, 0), 1)
+        else:
+            cv2.putText(img, 'not found', (w // 2, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.15, (0, 0, 255), 2)
+
+        cv2.imshow('sdf', img)
+        cv2.waitKey(0)
+
+        # _, axs = plt.subplots(nrows=1, ncols=1, squeeze=False)
+        # ax = axs[0, 0]
+        # ax.imshow(img.permute(1, 2, 0).numpy())
+        # ax.set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+        # plt.show()

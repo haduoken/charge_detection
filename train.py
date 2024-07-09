@@ -1,101 +1,116 @@
-import torchvision
-from data_loader import YOLODataSet, PennFudanDataset
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-
-# load a model pre-trained on COCO
-model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
-
-# replace the classifier with a new one, that has
-# num_classes which is user-defined
-num_classes = 2  # 1 class (person) + background
-# get number of input features for the classifier
-in_features = model.roi_heads.box_predictor.cls_score.in_features
-# replace the pre-trained head with a new one
-model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
-from torchvision.transforms import v2 as T
+import matplotlib.pyplot as plt
+import random
 import torch
-
-import vision_helper.utils as utils
-
-
-def get_transform(train):
-    transforms = []
-    if train:
-        transforms.append(T.RandomHorizontalFlip(0.5))
-    transforms.append(T.ToDtype(torch.float, scale=True))
-    transforms.append(T.ToPureTensor())
-    return T.Compose(transforms)
+import numpy as np
+from torch import nn
+from data_loader import *
 
 
-dataset = PennFudanDataset('PennFudanPed', get_transform(train=True))
-data_loader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=2,
-    shuffle=True,
-    num_workers=4,
-    collate_fn=utils.collate_fn
-)
+def register_torch():
+    import torch
 
-from vision_helper.engine import train_one_epoch, evaluate
+    try:
+        if torch.already_registed:
+            pass
+    except:
+        print('register print')
+        torch.already_registed = True
+        original_repr = torch.Tensor.__repr__
+        torch.Tensor.__repr__ = lambda self: f'{{Tensor:{tuple(self.shape)}}} {original_repr(self)}'
 
-# train on the GPU or on the CPU, if a GPU is not available
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-# our dataset has two classes only - background and person
-num_classes = 2
-# use our dataset and defined transformations
+register_torch()
 
-# split the dataset in train and test set
-indices = torch.randperm(len(dataset)).tolist()
-dataset = torch.utils.data.Subset(dataset, indices[:-50])
-dataset_test = torch.utils.data.Subset(dataset, indices[-50:])
+# deteministic
+seed = 1
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
 
-# define training and validation data loaders
-data_loader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=4,
-    shuffle=True,
-    num_workers=4,
-    collate_fn=utils.collate_fn
-)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-data_loader_test = torch.utils.data.DataLoader(
-    dataset_test,
-    batch_size=1,
-    shuffle=False,
-    num_workers=4,
-    collate_fn=utils.collate_fn
-)
 
-# move model to the right device
+from model import ChargeDetection
+from data_loader import ChargeDataset
+
+model = ChargeDetection()
 model.to(device)
 
-# construct an optimizer
-params = [p for p in model.parameters() if p.requires_grad]
-optimizer = torch.optim.SGD(
-    params,
-    lr=0.005,
-    momentum=0.9,
-    weight_decay=0.0005
-)
+n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print('number of params:', n_parameters)
 
-# and a learning rate scheduler
-lr_scheduler = torch.optim.lr_scheduler.StepLR(
-    optimizer,
-    step_size=3,
-    gamma=0.1
-)
+EPOCH = 40
+BS = 128
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=EPOCH // 3, gamma=0.1)
 
-# let's train it just for 2 epochs
-num_epochs = 25
+train_loader, val_loader = get_loader(BS)
 
-for epoch in range(num_epochs):
-    # train for one epoch, printing every 10 iterations
-    train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
-    # update the learning rate
-    lr_scheduler.step()
-    # evaluate on the test dataset
-    evaluate(model, data_loader_test, device=device)
+train_loss_arr = []
+val_loss_arr = []
 
-print("That's it!")
+best_val_loss = 0.01
+
+for epoch in range(EPOCH + 1):
+    loss = {"loss_ce": 0.0, "loss_bbox": 0.0, "loss_giou": 0.0, "total": 0.0}
+    iter = 0
+
+    if epoch > 0:
+        model.train()
+        for batch_data in train_loader:
+            img = batch_data['img'].to(device)
+            target = {'cls': batch_data['cls'].to(device), 'pt': batch_data['pt'].to(device)}
+
+            loss = model(img, target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        lr_scheduler.step()
+
+    # cur loss in train set
+    model.eval()
+    train_set_loss = 0
+    with torch.no_grad():
+        total_loss = 0.0
+        loss_cnt = 0
+
+        for batch_data in train_loader:
+            img = batch_data['img'].to(device)
+            target = {'cls': batch_data['cls'].to(device), 'pt': batch_data['pt'].to(device)}
+
+            loss = model(img, target)
+
+            total_loss += loss.item()
+            loss_cnt += 1
+
+        train_set_loss = total_loss / loss_cnt
+
+    # cur loss in val set
+    val_set_loss = 0
+    with torch.no_grad():
+        total_loss = 0.0
+        loss_cnt = 0
+        for batch_data in train_loader:
+            img = batch_data['img'].to(device)
+            target = {'cls': batch_data['cls'].to(device), 'pt': batch_data['pt'].to(device)}
+
+            loss = model(img, target)
+
+            total_loss += loss.item()
+            loss_cnt += 1
+
+        val_set_loss = total_loss / loss_cnt
+
+        print(f'{epoch=} train loss {train_set_loss} val loss {val_set_loss} lr {lr_scheduler.get_last_lr()}')
+        train_loss_arr.append(train_set_loss)
+        val_loss_arr.append(val_set_loss)
+
+    if val_set_loss < best_val_loss:
+        best_val_loss = val_set_loss
+        torch.save({'model': model.state_dict()}, 'best.pth')
+
+fig, axs = plt.subplots(1, 2)
+axs[0].plot(range(len(train_loss_arr)), train_loss_arr)
+axs[1].plot(range(len(val_loss_arr)), val_loss_arr)
+plt.show()

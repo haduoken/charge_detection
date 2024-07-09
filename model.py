@@ -1,28 +1,5 @@
 import torch
 from torch import nn
-from torchvision.models.resnet import resnet18
-
-
-def register_torch():
-    import torch
-
-    try:
-        if torch.already_registed:
-            pass
-    except:
-        print('register print')
-        torch.already_registed = True
-        original_repr = torch.Tensor.__repr__
-        torch.Tensor.__repr__ = lambda self: f'{{Tensor:{tuple(self.shape)}}} {original_repr(self)}'
-
-
-register_torch()
-
-
-IMG_SIZE = (16, 16)
-BS = 16
-
-torch.manual_seed(1)
 
 
 class BasicBlock(nn.Module):
@@ -67,7 +44,7 @@ class BasicBlock(nn.Module):
         return x
 
 
-class Model(nn.Module):
+class ChargeDetection(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.l1 = BasicBlock(1, 8, False)
@@ -76,23 +53,27 @@ class Model(nn.Module):
         self.l4 = BasicBlock(32, 64, True)
         self.l5 = BasicBlock(64, 128, True)
 
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(128, 3)
 
-        self.label_loss = nn.CrossEntropyLoss()
+        self.label_loss = nn.CrossEntropyLoss(weight=torch.tensor([1, 0.5]))
         self.pt_loss = nn.SmoothL1Loss()
 
     def loss(self, pred, target):
-        target_cls = target['cls']
-        target_pt = target['pt']
+        # pred (BS * 3)
+        target_cls = target['cls']  # BS
+        target_pt = target['pt']  # BS
         # 分类误差
         loss_label = self.label_loss(pred[:, :2], target_cls)
         # 回归误差
         keep = target_cls == 1
-        pos_target = target_pt[keep]  # BS * 1
-        pos_pred = pred[keep][:, 2]
+        pos_target = target_pt[keep]  # BS
+        pos_pred = pred[keep][:, 2]  # BS
+
+        if pos_target.numel() == 0:
+            return loss_label
 
         loss_pt = self.pt_loss(pos_pred, pos_target)
-
         return loss_label + loss_pt
 
     def forward(self, x, target=None):
@@ -102,6 +83,7 @@ class Model(nn.Module):
         x = self.l4(x)
         x = self.l5(x)
 
+        x = self.avgpool(x)
         x = torch.flatten(x, 1)
         pred = self.fc(x)
         if target is not None:
